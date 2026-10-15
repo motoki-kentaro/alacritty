@@ -3,10 +3,10 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::{Error, Result};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::IntoRawHandle;
+use std::os::windows::io::AsRawHandle;
 use std::{mem, ptr};
 
-use windows_sys::Win32::Foundation::{HANDLE, S_OK};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, S_OK};
 use windows_sys::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
 };
@@ -122,12 +122,17 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     let result = unsafe {
         (api.create)(
             window_size.into(),
-            conin_pty_handle.into_raw_handle() as HANDLE,
-            conout_pty_handle.into_raw_handle() as HANDLE,
+            conin_pty_handle.as_raw_handle() as HANDLE,
+            conout_pty_handle.as_raw_handle() as HANDLE,
             0,
             &mut pty_handle as *mut _,
         )
     };
+
+    // The pseudoconsole holds its own references to its end of the pipes, so ours must be
+    // closed to avoid leaking them.
+    drop(conin_pty_handle);
+    drop(conout_pty_handle);
 
     assert_eq!(result, S_OK);
 
@@ -232,6 +237,9 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
         if !success {
             return Err(Error::last_os_error());
         }
+
+        // The primary thread handle is not needed, only the process handle is used.
+        CloseHandle(proc_info.hThread);
     }
 
     let conin = UnblockedWriter::new(conin, PIPE_CAPACITY);
