@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::{Error, Result};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::{mem, ptr};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, S_OK};
@@ -245,8 +245,12 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     let conin = UnblockedWriter::new(conin, PIPE_CAPACITY);
     let conout = UnblockedReader::new(conout, PIPE_CAPACITY);
 
-    let child_watcher = ChildExitWatcher::new(proc_info.hProcess)?;
+    // SAFETY: `hProcess` is a valid handle returned by `CreateProcessW`, owned by nobody else.
+    let child_handle = unsafe { OwnedHandle::from_raw_handle(proc_info.hProcess as RawHandle) };
+
+    // Created before the watcher, so the pseudoconsole is closed if registering the wait fails.
     let conpty = Conpty { handle: pty_handle as HPCON, api };
+    let child_watcher = ChildExitWatcher::new(child_handle)?;
 
     Ok(Pty::new(conpty, conout, conin, child_watcher))
 }

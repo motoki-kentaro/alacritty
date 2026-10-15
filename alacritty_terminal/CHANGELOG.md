@@ -12,7 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
-- Leaked pipe and thread handles on Windows for every PTY created
+- Leaked pipe, thread and process handles on Windows for every PTY created
+- Child exit watcher callback context being leaked, and racing with drop, on Windows
 
 ## 0.26.0
 
