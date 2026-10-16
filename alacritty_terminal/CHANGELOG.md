@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - Leaked pipe, thread and process handles on Windows for every PTY created
 - Child exit watcher callback context being leaked, and racing with drop, on Windows
+- Leaked pseudoconsole and pipes on Windows when spawning the shell fails
 
 ## 0.26.0
 

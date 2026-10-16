@@ -21,6 +21,11 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::tty::ChildEvent;
 
+/// Process-wide handle counts are only meaningful if the tests measuring them do not run
+/// concurrently, so they all hold this lock.
+#[cfg(test)]
+pub(super) static HANDLE_COUNT_LOCK: Mutex<()> = Mutex::new(());
+
 struct Interest {
     poller: Arc<Poller>,
     event: Event,
@@ -180,9 +185,6 @@ mod tests {
     use super::super::PTY_CHILD_EVENT_TOKEN;
     use super::*;
 
-    /// Process-wide handle counts are only meaningful if these tests do not run concurrently.
-    static SERIAL: Mutex<()> = Mutex::new(());
-
     fn watch(child: &Child) -> ChildExitWatcher {
         let handle = child.as_handle().try_clone_to_owned().unwrap();
         ChildExitWatcher::new(handle).unwrap()
@@ -204,7 +206,7 @@ mod tests {
 
     #[test]
     pub fn event_is_emitted_when_child_exits() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = HANDLE_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         const WAIT_TIMEOUT: Duration = Duration::from_millis(200);
 
         let poller = Arc::new(Poller::new().unwrap());
@@ -234,7 +236,7 @@ mod tests {
     /// not block.
     #[test]
     fn drop_before_exit_releases_handle_without_blocking() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = HANDLE_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut child = spawn_sleeper();
         let _ = watch(&child); // Warm up thread pool.
         let before = handle_count();
@@ -254,7 +256,7 @@ mod tests {
     /// Dropping after the callback has run must release everything, too.
     #[test]
     fn drop_after_exit_releases_handle() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = HANDLE_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut child = Command::new("cmd.exe").args(["/c", "exit 0"]).spawn().unwrap();
         child.wait().unwrap();
         let _ = watch(&child);
@@ -274,7 +276,7 @@ mod tests {
     /// Race the callback against drop, with exit and drop happening at about the same time.
     #[test]
     fn drop_races_with_exit() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = HANDLE_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let before;
         {
             let mut child = Command::new("cmd.exe").args(["/c", "exit 0"]).spawn().unwrap();
@@ -305,7 +307,7 @@ mod tests {
     /// `register` / `deregister` while a callback may be posting must not deadlock the drop.
     #[test]
     fn drop_with_registered_poller() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = HANDLE_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let poller = Arc::new(Poller::new().unwrap());
         let mut child = spawn_sleeper();
         let watcher = watch(&child);

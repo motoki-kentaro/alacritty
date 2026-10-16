@@ -15,9 +15,10 @@ use windows_sys::core::{HRESULT, PWSTR};
 use windows_sys::{s, w};
 
 use windows_sys::Win32::System::Threading::{
-    CREATE_UNICODE_ENVIRONMENT, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
-    InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, UpdateProcThreadAttribute,
+    CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    STARTUPINFOW, UpdateProcThreadAttribute,
 };
 
 use crate::event::{OnResize, WindowSize};
@@ -107,6 +108,18 @@ impl Drop for Conpty {
 // The ConPTY handle can be sent between threads.
 unsafe impl Send for Conpty {}
 
+/// Deletes an initialized `PROC_THREAD_ATTRIBUTE_LIST` on drop.
+///
+/// Must only be created after `InitializeProcThreadAttributeList` succeeded, and must be dropped
+/// before the buffer backing the list.
+struct AttributeListGuard(LPPROC_THREAD_ATTRIBUTE_LIST);
+
+impl Drop for AttributeListGuard {
+    fn drop(&mut self) {
+        unsafe { DeleteProcThreadAttributeList(self.0) };
+    }
+}
+
 pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     let api = ConptyApi::new();
     let mut pty_handle: HPCON = 0;
@@ -135,6 +148,15 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     drop(conout_pty_handle);
 
     assert_eq!(result, S_OK);
+
+    // The pseudoconsole is owned from here on, so that every early return below closes it.
+    //
+    // The drain threads are started before the `Conpty` guard is created: locals are dropped in
+    // reverse order, so `conpty` is closed first while `conout` is still being read, which is
+    // required to not deadlock in `ClosePseudoConsole` (same order as the fields of `Pty`).
+    let conin = UnblockedWriter::new(conin, PIPE_CAPACITY);
+    let conout = UnblockedReader::new(conout, PIPE_CAPACITY);
+    let conpty = Conpty { handle: pty_handle as HPCON, api };
 
     let mut success;
 
@@ -189,13 +211,17 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
         }
     }
 
+    // The list is initialized from here on and must be deleted once it is no longer needed. This
+    // is declared after `attr_list` (and `conpty`), so it runs before the buffer is freed.
+    let _attr_list_guard = AttributeListGuard(startup_info_ex.lpAttributeList);
+
     // Set thread attribute list's Pseudo Console to the specified ConPTY.
     unsafe {
         success = UpdateProcThreadAttribute(
             startup_info_ex.lpAttributeList,
             0,
             PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-            pty_handle as *mut std::ffi::c_void,
+            conpty.handle as *mut std::ffi::c_void,
             mem::size_of::<HPCON>(),
             ptr::null_mut(),
             ptr::null_mut(),
@@ -242,14 +268,9 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
         CloseHandle(proc_info.hThread);
     }
 
-    let conin = UnblockedWriter::new(conin, PIPE_CAPACITY);
-    let conout = UnblockedReader::new(conout, PIPE_CAPACITY);
-
     // SAFETY: `hProcess` is a valid handle returned by `CreateProcessW`, owned by nobody else.
     let child_handle = unsafe { OwnedHandle::from_raw_handle(proc_info.hProcess as RawHandle) };
 
-    // Created before the watcher, so the pseudoconsole is closed if registering the wait fails.
-    let conpty = Conpty { handle: pty_handle as HPCON, api };
     let child_watcher = ChildExitWatcher::new(child_handle)?;
 
     Ok(Pty::new(conpty, conout, conin, child_watcher))
@@ -324,5 +345,83 @@ impl From<WindowSize> for COORD {
         let lines = window_size.num_lines;
         let columns = window_size.num_cols;
         COORD { X: columns as i16, Y: lines as i16 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+
+    use super::super::child::HANDLE_COUNT_LOCK;
+    use super::*;
+    use crate::tty::Shell;
+
+    fn handle_count() -> u32 {
+        let mut count = 0;
+        assert_ne!(unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) }, 0);
+        count
+    }
+
+    fn window_size() -> WindowSize {
+        WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 }
+    }
+
+    fn options(program: &str) -> Options {
+        Options {
+            shell: Some(Shell::new(program.into(), Vec::new())),
+            drain_on_exit: false,
+            working_directory: None,
+            env: HashMap::new(),
+            escape_args: true,
+        }
+    }
+
+    /// `CreateProcessW` failing after the pseudoconsole exists must release the pseudoconsole
+    /// and both pipes, and must not block.
+    #[test]
+    fn failed_process_creation_releases_pseudoconsole() {
+        let _serial = HANDLE_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let bad = options("kegon-no-such-program-4f1c.exe");
+
+        // Warm up lazily created process-wide state.
+        assert!(new(&bad, window_size()).is_err());
+        let before = handle_count();
+
+        let start = Instant::now();
+        for _ in 0..100 {
+            assert!(new(&bad, window_size()).is_err());
+        }
+        let elapsed = start.elapsed();
+
+        // Give the reader threads a moment to observe the closed pseudoconsole and exit.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle_count() > before && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(handle_count() <= before, "handles leaked: {before} -> {}", handle_count());
+        assert!(elapsed < Duration::from_secs(30), "failed creation blocked for {elapsed:?}");
+    }
+
+    /// The successful path stays leak free.
+    #[test]
+    fn successful_creation_and_drop_does_not_leak() {
+        let _serial = HANDLE_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let good = options("cmd.exe");
+
+        drop(new(&good, window_size()).unwrap());
+        std::thread::sleep(Duration::from_millis(500));
+        let before = handle_count();
+
+        for _ in 0..30 {
+            drop(new(&good, window_size()).unwrap());
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle_count() > before && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(handle_count() <= before, "handles leaked: {before} -> {}", handle_count());
     }
 }
