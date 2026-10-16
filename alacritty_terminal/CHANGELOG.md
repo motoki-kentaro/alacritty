@@ -10,11 +10,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+### Added
+
+- `tty::wait_for_pending_shells` on Windows, to wait at process exit until the shells of dropped terminals are gone; it returns a `ShellCleanup` that tells a timeout from a shell that could not be confirmed gone
+
 ### Fixed
 
 - Leaked pipe, thread and process handles on Windows for every PTY created
 - Child exit watcher callback context being leaked, and racing with drop, on Windows
 - Leaked pseudoconsole and pipes on Windows when spawning the shell fails
+- Shell (and its headless console host) staying alive forever on Windows when the pseudoconsole is closed right after spawning it; a shell still alive 500 ms after the close is now terminated, and only that shell
 
 ## 0.26.0
 

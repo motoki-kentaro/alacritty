@@ -12,11 +12,14 @@ use crate::tty::{ChildEvent, EventedPty, EventedReadWrite, Options, Shell};
 mod blocking;
 mod child;
 mod conpty;
+mod reaper;
 
 use blocking::{UnblockedReader, UnblockedWriter};
 use conpty::Conpty as Backend;
 use miow::pipe::{AnonRead, AnonWrite};
 use polling::{Event, Poller};
+use reaper::ShellReaper;
+pub use reaper::{ShellCleanup, wait_for_pending_shells};
 
 pub const PTY_CHILD_EVENT_TOKEN: usize = 1;
 pub const PTY_READ_WRITE_TOKEN: usize = 2;
@@ -24,6 +27,13 @@ pub const PTY_READ_WRITE_TOKEN: usize = 2;
 type ReadPipe = UnblockedReader<AnonRead>;
 type WritePipe = UnblockedWriter<AnonWrite>;
 
+/// A pseudoconsole with the shell running in it.
+///
+/// Dropping a `Pty` closes the pseudoconsole and makes sure the shell does not outlive it: a shell
+/// that is still alive afterwards is terminated by a short-lived helper thread after a grace
+/// period (see [`wait_for_pending_shells`] for the process exit). The drop itself does not wait
+/// for that, except when the helper thread cannot be created: then it blocks the dropping thread
+/// for up to 600 ms.
 pub struct Pty {
     // XXX: Backend is required to be the first field, to ensure correct drop order. Dropping
     // `conout` before `backend` will cause a deadlock (with Conpty).
@@ -31,6 +41,9 @@ pub struct Pty {
     conout: ReadPipe,
     conin: WritePipe,
     child_watcher: ChildExitWatcher,
+    // XXX: Must stay the last field: it only acts once the pseudoconsole is closed and the pipes
+    // are gone, since the graceful close is what normally ends the shell.
+    _shell_reaper: ShellReaper,
 }
 
 pub fn new(config: &Options, window_size: WindowSize, _window_id: u64) -> Result<Pty> {
@@ -43,8 +56,15 @@ impl Pty {
         conout: impl Into<ReadPipe>,
         conin: impl Into<WritePipe>,
         child_watcher: ChildExitWatcher,
+        shell_reaper: ShellReaper,
     ) -> Self {
-        Self { backend: backend.into(), conout: conout.into(), conin: conin.into(), child_watcher }
+        Self {
+            backend: backend.into(),
+            conout: conout.into(),
+            conin: conin.into(),
+            child_watcher,
+            _shell_reaper: shell_reaper,
+        }
     }
 
     pub fn child_watcher(&self) -> &ChildExitWatcher {

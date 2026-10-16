@@ -18,13 +18,14 @@ use windows_sys::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    STARTUPINFOW, UpdateProcThreadAttribute,
+    STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute,
 };
 
 use crate::event::{OnResize, WindowSize};
 use crate::tty::Options;
 use crate::tty::windows::blocking::{UnblockedReader, UnblockedWriter};
 use crate::tty::windows::child::ChildExitWatcher;
+use crate::tty::windows::reaper::{PendingShell, ShellReaper};
 use crate::tty::windows::{Pty, cmdline, win32_string};
 
 const PIPE_CAPACITY: usize = crate::event_loop::READ_BUFFER_SIZE;
@@ -245,6 +246,10 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
         None => ptr::null_mut(),
     };
 
+    // Counted as pending from before the process exists, so `wait_for_pending_shells` cannot miss
+    // a shell that is running but not yet owned by a `ShellReaper`. Released if creation fails.
+    let pending_shell = PendingShell::reserve();
+
     let mut proc_info: PROCESS_INFORMATION = unsafe { mem::zeroed() };
     unsafe {
         success = CreateProcessW(
@@ -271,9 +276,22 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     // SAFETY: `hProcess` is a valid handle returned by `CreateProcessW`, owned by nobody else.
     let child_handle = unsafe { OwnedHandle::from_raw_handle(proc_info.hProcess as RawHandle) };
 
+    // A second handle to the shell, to reap it if closing the pseudoconsole does not end it. If
+    // creating the watcher fails below, the reaper is dropped before `conpty` (locals drop in
+    // reverse order), so it hands the shell to its worker, which then sees the graceful close
+    // that `conpty` performs right after and only terminates a shell that survives it.
+    let shell_reaper = match ShellReaper::new(&child_handle, pending_shell) {
+        Ok(reaper) => reaper,
+        Err(err) => {
+            // Without a handle to reap it with, the shell must not be left running.
+            unsafe { TerminateProcess(child_handle.as_raw_handle() as HANDLE, 1) };
+            return Err(err);
+        },
+    };
+
     let child_watcher = ChildExitWatcher::new(child_handle)?;
 
-    Ok(Pty::new(conpty, conout, conin, child_watcher))
+    Ok(Pty::new(conpty, conout, conin, child_watcher, shell_reaper))
 }
 
 // Windows environment variables are case-insensitive, and the caller is responsible for
@@ -402,6 +420,61 @@ mod tests {
         }
         assert!(handle_count() <= before, "handles leaked: {before} -> {}", handle_count());
         assert!(elapsed < Duration::from_secs(30), "failed creation blocked for {elapsed:?}");
+    }
+
+    /// Closing a pseudoconsole right after the shell was spawned must not leave the shell behind,
+    /// even when the shell misses the close event (it then has to be reaped).
+    ///
+    /// Spawns real shells at a point where they may fail with `0xC0000142`, so it is ignored by
+    /// default; error dialogs are suppressed for the test process.
+    #[test]
+    #[ignore = "spawns real shells and closes them at once"]
+    fn immediate_close_leaves_no_shell() {
+        let _serial = HANDLE_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            WaitForSingleObject,
+        };
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn SetErrorMode(mode: u32) -> u32;
+        }
+        const SEM_FAILCRITICALERRORS: u32 = 1;
+        const SEM_NOGPFAULTERRORBOX: u32 = 2;
+        let previous = unsafe { SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX) };
+        unsafe { SetErrorMode(previous | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX) };
+
+        let iterations = std::env::var("KEGON_IMMEDIATE_CLOSE_N")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(10);
+        let mut still_alive = 0;
+        for _ in 0..iterations {
+            let pty = new(&options("cmd.exe"), window_size()).unwrap();
+            let pid = pty.child_watcher().pid().unwrap().get();
+            let observer = unsafe {
+                OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, 0, pid)
+            };
+            assert!(!observer.is_null());
+            // SAFETY: owned by nobody else; closed on drop.
+            let observer = unsafe { OwnedHandle::from_raw_handle(observer as RawHandle) };
+
+            let start = Instant::now();
+            drop(pty);
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "drop blocked: {:?}",
+                start.elapsed()
+            );
+
+            // 500 ms grace + termination confirmation, with margin.
+            let wait = unsafe { WaitForSingleObject(observer.as_raw_handle() as HANDLE, 5000) };
+            if wait != 0 {
+                still_alive += 1;
+            }
+        }
+        assert_eq!(still_alive, 0, "{still_alive} of {iterations} shells survived the close");
     }
 
     /// The successful path stays leak free.
